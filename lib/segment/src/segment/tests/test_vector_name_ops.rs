@@ -16,7 +16,9 @@ use crate::entry::entry_point::{
 };
 use crate::segment::Segment;
 use crate::segment_constructor::segment_builder::SegmentBuilder;
-use crate::segment_constructor::{build_segment, load_segment};
+use crate::segment_constructor::{
+    build_segment, get_vector_index_path, get_vector_storage_path, load_segment,
+};
 use crate::types::{
     Distance, HnswGlobalConfig, Indexes, SegmentConfig, VectorDataConfig, VectorStorageType,
 };
@@ -439,6 +441,112 @@ fn test_persistence_after_create_with_data() {
             "point {i} should have default vector after reload"
         );
     }
+}
+
+/// Recursively copy a directory tree (test helper).
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir_all(&entry.path(), &dst_path);
+        } else {
+            std::fs::copy(entry.path(), &dst_path).unwrap();
+        }
+    }
+}
+
+/// Regression test for vector-data resurrection across a `DeleteVectorName` /
+/// `CreateVectorName` cycle.
+///
+/// `delete_vector_name` removes the vector's storage directory synchronously,
+/// but a segment flush captures the per-vector storage flushers up front and
+/// runs them on a background thread (see `Segment::flusher`). A flush that was
+/// built *before* the delete can therefore execute *after* the delete's
+/// `remove_dir_all`, leaving the dropped vector's files back on disk behind the
+/// delete. We reproduce that outcome deterministically: snapshot the storage
+/// (and index) directory, delete the name, then restore the snapshot before
+/// recreating — standing in for the flush that wrote the files back.
+///
+/// When the name is recreated, `create_vector_name` must start from a clean
+/// slate. Otherwise it reopens the stale files and a point that was never
+/// re-upserted silently regains its old vector after reload.
+fn check_recreate_does_not_resurrect(
+    config: VectorNameConfig,
+    build_value: impl Fn() -> crate::data_types::vectors::VectorInternal,
+) {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let backup = Builder::new().prefix("stale_backup").tempdir().unwrap();
+    let mut segment = build_appendable_segment_with_data(dir.path());
+    let hw = hw();
+
+    let new_point = (NUM_POINTS as u64 + 1).into();
+
+    // Create "v2", write a point carrying v2 data, then persist it to disk.
+    segment.create_vector_name(100, "v2", &config).unwrap();
+    let mut vectors = NamedVectors::default();
+    vectors.insert(DEFAULT_VECTOR_NAME.to_owned(), vec![9.0f32; DIM].into());
+    vectors.insert("v2".to_owned(), build_value());
+    segment.upsert_point(101, new_point, vectors, &hw).unwrap();
+    segment.flush(true).unwrap();
+
+    // Snapshot the on-disk storage/index, so we can restore them after the
+    // delete — simulating an in-flight flush writing them back behind the
+    // delete's `remove_dir_all`.
+    let segment_path = segment.data_path();
+    let storage_path = get_vector_storage_path(&segment_path, "v2");
+    let index_path = get_vector_index_path(&segment_path, "v2");
+    let storage_backup = backup.path().join("storage");
+    let index_backup = backup.path().join("index");
+    copy_dir_all(&storage_path, &storage_backup);
+    if index_path.exists() {
+        copy_dir_all(&index_path, &index_backup);
+    }
+
+    segment.delete_vector_name(102, "v2").unwrap();
+
+    // The stale files reappear on disk after the delete removed them.
+    copy_dir_all(&storage_backup, &storage_path);
+    if index_backup.exists() {
+        copy_dir_all(&index_backup, &index_path);
+    }
+
+    // Recreate the same name — must produce an empty vector, not reopen stale data.
+    segment.create_vector_name(103, "v2", &config).unwrap();
+
+    let v2 = segment.vector("v2", new_point, &hw).unwrap();
+    assert!(
+        v2.is_none(),
+        "recreated vector resurrected stale data in memory"
+    );
+
+    // The clean slate must also survive a reload.
+    let segment_uuid = segment.uuid;
+    segment.flush(true).unwrap();
+    drop(segment);
+
+    let stopped = AtomicBool::new(false);
+    let loaded = load_segment(&segment_path, segment_uuid, None, &stopped).unwrap();
+    let v2 = loaded.vector("v2", new_point, &hw).unwrap();
+    assert!(
+        v2.is_none(),
+        "recreated vector resurrected stale data after reload"
+    );
+}
+
+#[test]
+fn test_recreate_dense_vector_name_does_not_resurrect_stale_data() {
+    check_recreate_does_not_resurrect(dense_vector_name_config(8), || vec![3.0f32; 8].into());
+}
+
+#[test]
+fn test_recreate_sparse_vector_name_does_not_resurrect_stale_data() {
+    check_recreate_does_not_resurrect(sparse_vector_name_config(), || {
+        SparseVector::new(vec![1, 29], vec![0.25, 0.5])
+            .unwrap()
+            .into()
+    });
 }
 
 #[test]
