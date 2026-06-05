@@ -7,6 +7,7 @@ use crate::vector_storage::multi_dense::read_only::ReadOnlyChunkedMultiDenseVect
 use crate::vector_storage::sparse::read_only::ReadOnlySparseVectorStorage;
 
 mod lifecycle;
+mod live_reload;
 mod read_ops;
 
 /// Read-only counterpart of [`super::super::VectorStorageEnum`].
@@ -38,6 +39,7 @@ mod tests {
     use tempfile::Builder;
 
     use super::*;
+    use crate::common::live_reload::LiveReload;
     use crate::data_types::vectors::{
         DenseVector, MultiDenseVectorInternal, TypedMultiDenseVectorRef, VectorRef,
     };
@@ -233,5 +235,67 @@ mod tests {
         let multi: TypedMultiDenseVectorRef<VectorElementType> =
             stored.as_vec_ref().try_into().unwrap();
         assert_eq!(multi.to_owned(), multis[5]);
+    }
+
+    /// The enum dispatches `live_reload` to the active (chunked) variant.
+    #[test]
+    fn live_reload_dispatches_to_active_variant() {
+        let dir = Builder::new().prefix("disp_reload").tempdir().unwrap();
+        let mut rng = StdRng::seed_from_u64(9);
+        let hw = HardwareCounterCell::disposable();
+        let first: Vec<DenseVector> = (0..200).map(|_| rand_vec(&mut rng)).collect();
+        let second: Vec<DenseVector> = (0..100).map(|_| rand_vec(&mut rng)).collect();
+
+        let mut writer = open_appendable_memmap_vector_storage_impl::<VectorElementType>(
+            dir.path(),
+            DIM,
+            Distance::Dot,
+            AdviceSetting::Global,
+            false,
+        )
+        .unwrap();
+        for (id, vector) in first.iter().enumerate() {
+            writer
+                .insert_vector(id as PointOffsetType, VectorRef::from(vector), &hw)
+                .unwrap();
+        }
+        writer.flusher()().unwrap();
+
+        let mut storage = VectorStorageReadEnum::<MmapFile>::open(
+            &MmapFs,
+            &dense_config(VectorStorageType::ChunkedMmap, None),
+            dir.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(storage.total_vector_count(), first.len());
+
+        for (offset, vector) in second.iter().enumerate() {
+            writer
+                .insert_vector(
+                    (first.len() + offset) as PointOffsetType,
+                    VectorRef::from(vector),
+                    &hw,
+                )
+                .unwrap();
+        }
+        let deleted_ids: Vec<PointOffsetType> = vec![5, 100];
+        for &id in &deleted_ids {
+            writer.delete_vector(id).unwrap();
+        }
+        writer.flusher()().unwrap();
+
+        let new_ids: Vec<PointOffsetType> = (first.len()..first.len() + second.len())
+            .map(|offset| offset as PointOffsetType)
+            .collect();
+        storage
+            .live_reload(&MmapFs, &deleted_ids, &new_ids, &hw)
+            .unwrap();
+
+        assert_eq!(storage.total_vector_count(), first.len() + second.len());
+        assert_eq!(storage.deleted_vector_count(), deleted_ids.len());
+        for &id in &deleted_ids {
+            assert!(storage.is_deleted_vector(id));
+        }
     }
 }
