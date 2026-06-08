@@ -387,6 +387,11 @@ impl<S: UniversalRead> MultivectorOffsetsStorageChunkedRead<S> {
     pub fn clear_cache(&self) -> OperationResult<()> {
         self.data.clear_cache()
     }
+
+    /// Pick up offsets a writer appended to the chunked backing.
+    pub fn live_reload(&mut self, fs: &S::Fs) -> OperationResult<()> {
+        self.data.live_reload(fs, AdviceSetting::Global, false)
+    }
 }
 
 impl<S: UniversalRead> MultivectorOffsetsStorage for MultivectorOffsetsStorageChunkedRead<S> {

@@ -40,6 +40,11 @@ impl<S: UniversalRead> QuantizedChunkedStorageRead<S> {
     pub fn clear_cache(&self) -> OperationResult<()> {
         self.data.clear_cache()
     }
+
+    /// Pick up quantized vectors a writer appended to the chunked backing.
+    pub fn live_reload(&mut self, fs: &S::Fs) -> OperationResult<()> {
+        self.data.live_reload(fs, AdviceSetting::Global, false)
+    }
 }
 
 impl<S: UniversalRead> quantization::EncodedStorage for QuantizedChunkedStorageRead<S> {
